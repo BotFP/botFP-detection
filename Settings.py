@@ -16,31 +16,24 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
-from collections import OrderedDict
 import sys
 import os
 import socket
 import struct
 import warnings
 import csv
-from sklearn import metrics
 from sklearn.cluster import DBSCAN
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+
 warnings.filterwarnings('ignore')
 
-class Dataset:
-    def __init__(self, path_file, path_figs):
+class Scenario:
+    def __init__(self, path_file):
         self.path_file = path_file
-        self.path_figs = path_figs
         self.flowdata = pd.DataFrame()
         self.hosts = []
-        self.unique_hosts = []
-        self.hosts_study = {}
-        self.hosts_proto = {}
         self.bots = []
-        self.pairs = []
+        self.hosts_proto = {}
         
 class Protocol():
     def __init__(self, proto, color):
@@ -64,190 +57,148 @@ class Attribute():
         
 class Cluster:
     bot = False
-    ind_cluster = - 1
     hosts = []
     coord = []
     
-    def __init__(self, bot, ind_cluster, hosts, coord):
+    def __init__(self, bot, hosts, coord):
         self.bot = bot
-        self.ind_cluster = ind_cluster
         self.hosts = hosts
         self.coord = coord
 
+# convert the IP into an integer, e.g. IP 255.255.255.255 = 255*(256^3) + 255*(256^2) + 255*256 + 255 = 4294967295
 def ip2int(addr):
     return struct.unpack('!I', socket.inet_aton(addr))[0]
 
+# convert a hexadecimal number (e.g. for ICMP) to an integer file
 def hexa2int(hexa):
     if str(hexa) == 'nan':
         return 0
     return int(str(hexa), 0)
-        
-def get_list_hosts(dataset_type, min_pkt_proto):
-    list_hosts = []
-    for ind_d, dataset in enumerate(datasets):
-        if dataset_type == 'training' and ind_d in TRAINING:
-            for host in dataset.hosts:
-                for p in protocols:
-                    if host in dataset.hosts_proto[min_pkt_proto][p.proto]:
-                        list_hosts.append(str(ind_d) + '_' + host)
-                        break
-        elif dataset_type == 'testing' and ind_d not in TRAINING:
-            for host in dataset.hosts:
-                for p in protocols:
-                    if host in dataset.hosts_proto[min_pkt_proto][p.proto]:
-                        list_hosts.append(str(ind_d) + '_' + host)
-                        break
-    return list_hosts
 
-def get_coord_hosts(dataset_type, list_hosts, min_pkt_proto, nb_bin, bins_type, n_top_hosts):
-    list_bins, total_hosts = ({} for i in range(2))
-    clusters = []
-    for id_host in list_hosts:
-        ind_d, host = id_host.split('_')
-        total_hosts[id_host] = len_dataset[datasets[int(ind_d)]][host]
-    od = OrderedDict(sorted(total_hosts.items(), key=lambda x:x[1], reverse=True))
-    top_hosts = list(od.keys())
-    hosts_todeal = top_hosts[:n_top_hosts] if n_top_hosts != 0 else top_hosts
-    for ind_d, dataset in enumerate(datasets):
-        if dataset_type == 'training':
-            if ind_d in TRAINING:
-                for bot in dataset.bots:
-                    bot_ip = str(ind_d) + '_' + bot
-                    if bot_ip not in hosts_todeal:
-                        hosts_todeal.append(bot_ip)
-        if dataset_type == 'testing':
-            if ind_d not in TRAINING:
-                for bot in dataset.bots:
-                    bot_ip = str(ind_d) + '_' + bot
-                    if bot_ip not in hosts_todeal:
-                        hosts_todeal.append(bot_ip)
+def compute_hosts_signatures(packets, scenarios, list_hosts, min_pkt_proto, nb_bin, bins_type, ad_bins):
+    signatures = {}
         
-    for id_host in hosts_todeal:
-        list_bins[id_host] = []
-        ind_d, host = id_host.split('_')
+    for id_host in list_hosts:
+        signatures[id_host] = []
+        ind_scen, host = id_host.split('_')
         for p in protocols:
             for a in attributes:
-                if host in datasets[int(ind_d)].hosts_proto[min_pkt_proto][p.proto]:
+                if host in scenarios[int(ind_scen)].hosts_proto[p.proto]:
                     if bins_type == 'regular':
-                        hist, bin_edges = np.histogram(p.get_list(out_src[datasets[int(ind_d)]][host], a.att),
+                        hist, bin_edges = np.histogram(p.get_list(packets[scenarios[int(ind_scen)]][host], a.att),
                                                        bins=nb_bin, range=[0, a.limit], density=True)
                     elif bins_type == 'adaptive':
-                        hist, bin_edges = np.histogram(p.get_list(out_src[datasets[int(ind_d)]][host], a.att),
-                                                   bins=new_bins[a.label + '_' + p.proto][nb_bin], density=True)
+                        hist, bin_edges = np.histogram(p.get_list(packets[scenarios[int(ind_scen)]][host], a.att),
+                                                   bins=ad_bins[a.label + '_' + p.proto][nb_bin], density=True)
+                    # replace eventual NaN values by 0
                     hist[np.isnan(hist)] = 0
                 else:
+                    # if the host contains less than MIN_PKT_PROTO packets for the given protocol, we do not compute the frequency distribution
+                    # but we replace it by a list containg only 0 values ([0, 0, .., 0])
                     hist = np.zeros(nb_bin)
-                list_bins[id_host].extend(hist)
-        if all(x == 0.0 for x in list_bins[id_host]):
-            del list_bins[id_host]
-    return list_bins
+                
+                signatures[id_host].extend(hist)
 
-def clustering(list_hosts, min_pkt_proto, nb_bin, bins_type, n_top_hosts, eps):
-    list_bins = get_coord_hosts('training', list_hosts, min_pkt_proto, nb_bin, bins_type, n_top_hosts)
-    scaler = StandardScaler()
-    standard_len = min([len(x) for x in list(list_bins.values())])
-    for k, v in list_bins.items():
-        if len(v) > standard_len:
-            list_bins[k] = list_bins[k][:standard_len]
-    scaler.fit(list(list_bins.values()))
-    X = scaler.transform(list(list_bins.values()))
+        # # if all signatures are made from [0, 0, .., 0], i.e. less than MIN_PKT_PROTO packets for all protocols, we discard the host
+        # if all(x == 0.0 for x in signatures[id_host]):
+        #     del signatures[id_host]
+
+    return signatures
+
+def clustering(packets, scenarios, list_hosts, min_pkt_proto, nb_bin, bins_type, eps, ad_bins):
+    signatures = compute_hosts_signatures(packets, scenarios, list_hosts, min_pkt_proto, nb_bin, bins_type, ad_bins)
+
+    # enables to standardize length if host coordinates contain 1 or 2 more bins than usual
+    standard_len = min([len(x) for x in list(signatures.values())])
+    signatures = dict((k, v[:standard_len] if len(v) > standard_len else v) for k, v in signatures.items())
+
+    X = StandardScaler().fit_transform(list(signatures.values()))
     cl = DBSCAN(eps=eps, min_samples=1, metric='l1').fit(X)
+
+    # we get a list of clusters IDs
+    # e.g. [0, 0, 1, 2, 1, 1] means that the first 2 points belong to cluster 0, the 3rd and 2 last points to cluster 1, and the 4th to cluster 2
     labels = cl.labels_
     clusters = []
-        
-    add_hosts = 0
-    n_bot_clusters = 0
+    
+    # head is the id of the cluster; so for each unique cluster id:
     for head in range(max(labels) + 1):
         hosts = []
         bool_bot = False
         for ind_lab, lab in enumerate(labels):
             if head == lab:
-                hosts.append(list(list_bins.keys())[ind_lab])
-                ind_d, host = list(list_bins.keys())[ind_lab].split('_')
-                if host in datasets[int(ind_d)].bots:
-                    bool_bot = True
-        cluster_points = [list_bins[host] for host in hosts]
-        clusters.append(Cluster(bool_bot, head, hosts, np.mean(cluster_points, axis=0)))
-        if bool_bot:
-            n_bot_clusters += 1
-            for id_host in hosts:
-                ind_d, host = id_host.split('_')
-                if host not in datasets[int(ind_d)].bots:
-                    add_hosts += 1
-                    
-    silhou = metrics.silhouette_score(X, labels) if len(set(labels)) > 2 else 0
-    return list_bins, labels, X, clusters, len(set(labels)), silhou, add_hosts, scaler
+                hosts.append(list(signatures.keys())[ind_lab])
+                ind_scen, host = list(signatures.keys())[ind_lab].split('_')
 
-def classification(list_hosts, min_pkt_proto, nb_bin, bins_type, coord_clusters, scaler, n_top_hosts):
-    bots_wellclassified, normal_misclassified, bots_misclassified, normal_wellclassified = ([] for i in range(4))
-    list_bins = get_coord_hosts('testing', list_hosts, min_pkt_proto, nb_bin, bins_type, n_top_hosts)
-    for id_host, coord_host in list_bins.items():
-        ind_d, host = id_host.split('_')
+                # if the cluster contains at least one bot, thus the cluster is labelled as bot (i.e. bool_bot = True)
+                if host in scenarios[int(ind_scen)].bots:
+                    bool_bot = True
+
+        cluster_coordinates = [signatures[host] for host in hosts]
+
+        # the coordinates of the cluster is the barycenter of the coordinates of all the hosts it contains
+        barycentre = np.mean(cluster_coordinates, axis=0)
+        clusters.append(Cluster(bool_bot, hosts, barycentre))
+                    
+    return clusters, len(set(labels))
+
+def classification(packets, scenarios, list_hosts, min_pkt_proto, nb_bin, bins_type, coord_clusters, ad_bins):
+    tp, fp, tn, fn = ([] for i in range(4))
+
+    signatures = compute_hosts_signatures(packets, scenarios, list_hosts, min_pkt_proto, nb_bin, bins_type, ad_bins)
+    for id_host, coord_host in signatures.items():
+        ind_scen, host = id_host.split('_')
         distances = {}
         for cluster in coord_clusters:
-            if len(cluster.coord) > len(coord_host):
-                distances[cluster] = np.linalg.norm(np.array(cluster.coord[:len(coord_host)]) - np.array(coord_host), ord=1)
-            elif len(cluster.coord) < len(coord_host):
-                distances[cluster] = np.linalg.norm(np.array(cluster.coord) - np.array(coord_host[:len(cluster.coord)]), ord=1)
-            elif len(cluster.coord) == len(coord_host):
-                distances[cluster] = np.linalg.norm(np.array(cluster.coord) - np.array(coord_host), ord=1)
-        
-        cluster_closer = min(distances, key=distances.get)
-        if cluster_closer.bot:
-            list_append = bots_wellclassified if host in datasets[int(ind_d)].bots else normal_misclassified
-        else:
-            list_append = bots_misclassified if host in datasets[int(ind_d)].bots else normal_wellclassified
-        list_append.append(id_host)
-    tp = bots_wellclassified
-    fn = bots_misclassified
-    fp = normal_misclassified
-    tn = normal_wellclassified
-    precision = float(len(tp)) / len(tp + fp) if len(tp + fp) != 0 else 0
-    recall = float(len(tp)) / len(tp + fn) if len(tp + fn) != 0 else 0
-    f1_score = 2 * (precision * recall) / (precision + recall) if precision + recall != 0 else 0
-    return precision, recall, f1_score
 
-def full_process(list_hosts_tr, list_hosts_te, min_pkt_proto, nb_bin, bins_type, density):
-    n_top_hosts = 0
-    list_bins_tr = get_coord_hosts('training', hosts_training[param], param, nb_bin, bins_type, density)
-    list_bins_te = get_coord_hosts('testing', hosts_testing[param], param, nb_bin, bins_type, density)
-    standard_len = min([len(x) for x in list(list_bins_tr.values())])
-    for k, v in list_bins_tr.items():
-        list_bins_tr[k] = list_bins_tr[k][:standard_len]
-    for k, v in list_bins_te.items():
-        list_bins_te[k] = list_bins_te[k][:standard_len]
-                
-    X_train = list(list_bins_tr.values())
-    X_test = list(list_bins_te.values())
-    Y_train, Y_test = ([] for i in range(2))
-    for id_host in list(list_bins_tr.keys()):
-        ind_d, host = id_host.split('_')
-        if host in datasets[int(ind_d)].bots:
-            Y_train.append('bot')
+            # standardize length because once again, one signature can contain one or two more bins than the other one
+            standard_len = min([len(x) for x in [cluster.coord, coord_host]])
+            cluster.coord = cluster.coord[:standard_len]
+            coord_host = coord_host[:standard_len]
+
+            distances[cluster] = np.linalg.norm(np.array(cluster.coord) - np.array(coord_host), ord=1)
+        
+        closest_cluster = min(distances, key=distances.get)
+
+        # if the closest cluster is a bot
+        if closest_cluster.bot:
+            # and the host was really a bot, then it is a true positive
+            if host in scenarios[int(ind_scen)].bots:
+                tp.append(id_host)
+            # but the host was in fact benign, then it is a false positive
+            else:
+                fp.append(id_host)
+        # if the closest cluster is benign
         else:
-            Y_train.append('benign')
-            
-    for id_host in list(list_bins_te.keys()):
-        ind_d, host = id_host.split('_')
-        if host in datasets[int(ind_d)].bots:
-            Y_test.append('bot')
-        else:
-            Y_test.append('benign')
-    
-    sc = StandardScaler()
-    X_train = sc.fit_transform(X_train)
-    X_test = sc.transform(X_test)
-    return X_train, Y_train, X_test, Y_test
+            # but the host was a bot, then it is a false negative
+            if host in scenarios[int(ind_scen)].bots:
+                fn.append(id_host)
+            # and the host was really benign, then it is a true negative
+            else:
+                tn.append(id_host)
+
+    tpr = float(len(tp)) / len(tp + fn) if len(tp + fn) != 0 else 0
+    fpr = float(len(fp)) / len(tn + fp) if len(tn + fp) != 0 else 0
+    accuracy = float(len(tp + tn)) / len(tp + tn + fp + fn) if len(tp + tn + fp + fn) != 0 else 0
+
+    return tpr, fpr, accuracy
         
 MAIN_PATH = '/Users/agatheblaise/CTU-13-Dataset/'
 IP_BOTNET = '147.32.84.165'
 MIN_PKT_PROTO = 150
-EPSILONS = range(1, 511, 30)
 TRAINING = [2, 3, 4, 6, 9, 10, 11, 12]
-ATT = ['Sport', 'Dport', 'Proto', 'Label', 'SrcAddr', 'DstAddr', 'StartTime']
-NB_BINS_VARY = [8, 16, 32, 64, 128, 256, 512, 1024]
-PERS = np.arange(0.1, 1.1, 0.1)
-BINS_TYPES = ['adaptive', 'regular']  
+ATT = ['Sport', 'Dport', 'Proto', 'Label', 'SrcAddr', 'DstAddr']
+LINE_STYLES = ['--', '-.', ':', '-', '-.', ':', '--', '-.']
+MARKERS = ['o', 'v', '^', 'p', 's', '*', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', 'X']
+
+# parameters for tuning
+# BINS_TYPES = ['adaptive', 'regular']
+# NB_BINS_VARY = [8, 16, 32, 64, 128, 256, 512, 1024]
+# EPSILONS = range(1, 511, 30)
+
+# best parameters
+BINS_TYPES = ['adaptive']
+NB_BINS_VARY = [512]
+EPSILONS = [300]
 
 
 protocols = [Protocol('tcp', 'b'), Protocol('udp', 'g'), Protocol('icmp', 'r')]

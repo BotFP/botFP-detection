@@ -15,259 +15,135 @@
 
 from Settings import *
 
-def init():
-    datasets = []
+def initialisation():
+    scenarios = []
     cap_files = [MAIN_PATH + str(d) for d in range(1, 14)]
     for f in cap_files:
-        file = next(x for x in os.listdir(f) if 'binetflow' in x)
-        dataset = Dataset(f + '/' + file, f + '/figs/')
-        frame = pd.read_csv(f + '/' + file, header=0)
-        dataset.flowdata = dataset.flowdata.append(frame, ignore_index=True)
-        dataset.flowdata.rename(columns=lambda x: x.strip(), inplace = True)
-        dataset.unique_hosts = dataset.flowdata['SrcAddr'].unique()
-        dataset.hosts = [x for x in dataset.unique_hosts if '147.32.' in x]
-        temp_bots = dataset.flowdata[dataset.flowdata['Label'].str.contains('Botnet')]['SrcAddr'].unique()
-        dataset.bots = [x for x in temp_bots if '147.32' in x]
-        datasets.append(dataset)
+        binetflow_file = next(x for x in os.listdir(f) if 'binetflow' in x)
+        scen = Scenario(f + '/' + binetflow_file)
+        frame = pd.read_csv(f + '/' + binetflow_file, header=0)
 
-    out_src = {}
-    out_dst = {}
-    for dataset in datasets:
-        out_src[dataset] = {}
-        out_dst[dataset] = {}
-        for host in dataset.hosts:
-            out_src[dataset][host] = {}
-            out_dst[dataset][host] = {}
-            host_flows_src = dataset.flowdata.loc[dataset.flowdata.SrcAddr == host]
-            host_flows_dst = dataset.flowdata.loc[dataset.flowdata.DstAddr == host]
+        # flowdata is a pandas Dataframe containing all flows from a given scenario
+        # it is a column-based representation to handle data
+        scen.flowdata = scen.flowdata.append(frame, ignore_index=True)
+        scen.flowdata.rename(columns=lambda x: x.strip(), inplace = True)
+
+        # append to scen.hosts all unique source IP addresses in 147.32.X.X (internal network)
+        hosts = scen.flowdata['SrcAddr'].unique()
+        scen.hosts = [x for x in hosts if '147.32.' in x]
+
+        # append to scen.bots all malicious source IP addresses in 147.32.X.X (internal network)
+        bots = scen.flowdata[scen.flowdata['Label'].str.contains('Botnet')]['SrcAddr'].unique()
+        scen.bots = [x for x in bots if '147.32' in x]
+
+        scenarios.append(scen)
+
+    # define dictionary containing all packets taken by a particular host from a scenario for a given protocol
+    # e.g. packets[scen1][host1]['TCP'] contain all TCP packets from host1 from scenario1
+    # we will compute the frequency distributions of such value later, to build the hosts signatures
+    packets = {}
+    for scen in scenarios:
+        packets[scen] = {}
+        for host in scen.hosts:
+            packets[scen][host] = {}
+            flows = scen.flowdata.loc[scen.flowdata.SrcAddr == host]
             for p in protocols:
-                out_src[dataset][host][p.proto] = host_flows_src.loc[:, ATT].loc[host_flows_src.Proto == p.proto]
-                out_dst[dataset][host][p.proto] = host_flows_dst.loc[:, ATT].loc[host_flows_dst.Proto == p.proto]
-                if not out_src[dataset][host][p.proto].empty and not out_dst[dataset][host][p.proto].empty:
-                    out_src[dataset][host][p.proto] = out_src[dataset][host][p.proto].fillna(0)
-                    out_dst[dataset][host][p.proto] = out_dst[dataset][host][p.proto].fillna(0)           
+                packets[scen][host][p.proto] = flows.loc[:, ATT].loc[flows.Proto == p.proto]
+                if not packets[scen][host][p.proto].empty:
+                    packets[scen][host][p.proto] = packets[scen][host][p.proto].fillna(0)
 
-    for dataset in datasets:
-        dataset.hosts_proto[MIN_PKT_PROTO] = {}
+    # for each protocol, store the list of hosts with at least MIN_PKT_PROTO packets
+    # e.g. for scenario1 and TCP, keep the list of hosts with at least MIN_PKT_PROTO TCP packets
+    for ind_scen, scen in enumerate(scenarios):
+        scen.hosts_proto = {}
         for p in protocols:
-            dataset.hosts_proto[MIN_PKT_PROTO][p.proto] = []
-            for host in dataset.hosts:
-                len_dataset2 = len(p.get_list(out_src[dataset][host], 'Sport'))
-                if len_dataset2 >= MIN_PKT_PROTO:
-                    dataset.hosts_proto[MIN_PKT_PROTO][p.proto].append(host)
-                        
-    len_dataset = {}
-    for dataset in datasets:
-        len_dataset[dataset] = {}
-        for host in dataset.hosts:
-            len_dataset[dataset][host] = 0
-            for p in protocols:
-                len_dataset[dataset][host] += len(p.get_list(out_src[dataset][host], 'Sport'))
+            scen.hosts_proto[p.proto] = []
+            for host in scen.hosts:
+                if len(p.get_list(packets[scen][host], 'Sport')) >= MIN_PKT_PROTO:
+                    scen.hosts_proto[p.proto].append(host)
+
+    hosts_training, hosts_test = ([] for i in range(2))
+    for ind_scen, scen in enumerate(scenarios):
+        if ind_scen in TRAINING:
+            hosts_training.extend([str(ind_scen) + '_' + x for x in list(set(scen.hosts_proto['tcp'] + scen.hosts_proto['udp'] + scen.hosts_proto['icmp'] + scen.bots))])
+        else:
+            hosts_test.extend([str(ind_scen) + '_' + x for x in list(set(scen.hosts_proto['tcp'] + scen.hosts_proto['udp'] + scen.hosts_proto['icmp']  + scen.bots))])
+
+    return scenarios, packets, hosts_training, hosts_test
                 
-    vectors, new_bins = ({} for i in range(2))
+def define_adaptive_bins():
+    ad_bins, vectors = ({} for i in range(2))
+
     with open('vectors.csv', 'r') as csv_file:
         read_csv = csv.reader(csv_file, delimiter=';')
         for row in read_csv:
             vectors[row[0]] = [int(x) for x in row[1][1:-1].split(',')]
-        
-    new_bins = {}
-    for p in protocols:
-        for a in attributes:
-            feat = a.label + '_' + p.proto
-            new_bins[feat] = {}
-            step = a.limit / 1000
-            bin_edges = np.arange(0, a.limit, step)
-            cumsum = np.cumsum(vectors[feat])
-            cumsum = np.insert(cumsum, 0, 0.0)
-            for nb_bin in nb_bin_vary:
-                new_bins[feat][nb_bin] = []
-                step = max(cumsum) / nb_bin
-                new_y = np.arange(0, max(cumsum), step)
-                for el in new_y:
-                    for index in range(len(cumsum) - 1):
-                        if cumsum[index] <= el < cumsum[index+1]:
-                            new_bins[feat][nb_bin].append(bin_edges[index])
 
-def define_adaptive_bins():
-    new_bins = {}
     for p in protocols:
         for a in attributes:
-            feat = a.label + '_' + p.proto
-            new_bins[feat] = {}
-            step = a.limit / 1000
+            # feature in [Sport_TCP, Dport_TCP, Dip_TCP, Sport_UDP, Dport_UDP, Dip_UDP, Sport_ICMP, Dport_ICMP, Dip_ICMP]
+            feature = a.label + '_' + p.proto
+            ad_bins[feature] = {}
+            step = a.limit / 1000 # e.g. for source port, divide the maximum (65,536) into 1,000 bins and compute number of different ports for each bin
+            # e.g. in the range [0, 1023]: a lot of different destination port numbers but small different source port numbers
             bin_edges = np.arange(0, a.limit, step)
-            cumsum = np.cumsum(vectors[feat])
+            cumsum = np.cumsum(vectors[feature])
             cumsum = np.insert(cumsum, 0, 0.0)
+
+            # then here, form nb_bin bins (e.g. 32 bins) so that there is the same number of ports in each bin
+            # the bins will then have an adaptive width depending on the amount of information
             for nb_bin in NB_BINS_VARY:
-                new_bins[feat][nb_bin] = []
+                ad_bins[feature][nb_bin] = []
                 step = max(cumsum) / nb_bin
                 new_y = np.arange(0, max(cumsum), step)
                 for el in new_y:
                     for index in range(len(cumsum) - 1):
                         if cumsum[index] <= el < cumsum[index+1]:
-                            new_bins[feat][nb_bin].append(bin_edges[index])
+                            ad_bins[feature][nb_bin].append(bin_edges[index])
 
-def botFP_clus():
-    tpr_cl, fpr_cl = ({} for i in range(2))
-    hosts_training, hosts_testing, list_bins, labels, res, coord_clusters, tp, tn, fp, fn, tp_d, tn_d, fp_d, fn_d = ({} for i in range(14))
-    hosts_training[MIN_PKT_PROTO] = get_list_hosts('training', MIN_PKT_PROTO)
-    hosts_testing[MIN_PKT_PROTO] = get_list_hosts('testing', MIN_PKT_PROTO)
+    return ad_bins
+
+def botFP_clus(packets, scenarios, hosts_training, hosts_test, ad_bins):
+    signatures, coord_clusters, nb_clusters, tpr, fpr, accuracy = ({} for i in range(6))
     for nb_bin in NB_BINS_VARY:
         for bin_type in BINS_TYPES:
             id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), bin_type])
-            list_bins[id], labels[id], res[id], coord_clusters[id], tpr_cl[id], fpr_cl[id] = ({} for i in range(6))
-            tp[id], fn[id], fp[id], tn[id], tp_d[id], fn_d[id], fp_d[id], tn_d[id] = ({} for i in range(8))
+            signatures[id], coord_clusters[id], nb_clusters[id], tpr[id], fpr[id], accuracy[id] = ({} for i in range(6))
             for eps in EPSILONS:
-                list_bins[id][eps], labels[id][eps], res[id][eps], coord_clusters[id][eps], labels[id][eps], silhou, add_hosts, scaler = clustering(hosts_training[MIN_PKT_PROTO], MIN_PKT_PROTO, nb_bin, bin_type, 0, eps)
-                tp[id][eps], fn[id][eps], fp[id][eps], tn[id][eps], tp_d[id][eps], fn_d[id][eps], fp_d[id][eps], tn_d[id][eps], tpr_cl[id][eps], fpr_cl[id][eps] = classification(hosts_testing[MIN_PKT_PROTO], MIN_PKT_PROTO, nb_bin, bin_type, coord_clusters[id][eps], scaler, 0)
-    return tpr_cl, fpr_cl
+                # clustering = learning
+                coord_clusters[id][eps], nb_clusters[id][eps] = clustering(packets, scenarios, hosts_training, MIN_PKT_PROTO, nb_bin, bin_type, eps, ad_bins)
 
-def fig_precision():
+                # classification = evaluation
+                tpr[id][eps], fpr[id][eps], accuracy[id][eps] = classification(packets, scenarios, hosts_test, MIN_PKT_PROTO, nb_bin, bin_type, coord_clusters[id][eps], ad_bins)
+    return tpr, fpr, accuracy, nb_clusters
+
+def plot_figure(metric, metric_values):
     FONT_SIZE = 15
     LABEL_SIZE = 12
-    fig_reg, ax_reg = plt.subplots(figsize=(5, 4.5))
-    fig_ad, ax_ad = plt.subplots(figsize=(5, 4.5))
-    line_styles = ['--', '-.', ':', '-', '-.', ':', '--', '-.']
-    markers = ['o', 'v', '^', 'p', 's', '*', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', 'X']
 
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'regular'])
-        list_acc = [precision_per[id][x] for x in PERS]
-        ax_reg.plot(PERS, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
+    # plot figure for regular and adaptive bins
+    for bins_type in BINS_TYPES:
+        fig, ax = plt.subplots(figsize=(5, 4.5), dpi=400)
+        for ind_param, nb_bin in enumerate(NB_BINS_VARY):
+            id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), bins_type])
+            ax.plot(EPSILONS, metric_values[id][x],  label= r'$b =%d$' % (nb_bin), marker=MARKERS[ind_param], ls=LINE_STYLES[ind_param], markersize=8, linewidth=2)
         
-    ax_reg.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_reg.set_ylim(-0.05, 1.05)
-    ax_reg.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_reg.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_reg.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
+        ax.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
+        ax.set_ylim(-0.05, 1.05)
+        ax.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=LABEL_SIZE)
+        ax.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
+        ax.set_xticklabels(EPSILONS)
 
-    fig_reg.tight_layout()
-    fig_reg.savefig('precision_regular_per.png', dpi=400)
-
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'adaptive'])
-        list_acc = [precision_per[id][x] for x in PERS]
-        ax_ad.plot(PERS, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
-
-    ax_ad.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_ad.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_ad.set_ylim(-0.05, 1.05)
-    ax_ad.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_ad.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
-
-    fig_ad.tight_layout()
-    fig_ad.savefig('precision_adaptive_per.png', dpi=400)
-
-def fig_recall():
-    FONT_SIZE = 15
-    LABEL_SIZE = 12
-    fig_reg, ax_reg = plt.subplots(figsize=(5, 4.5))
-    fig_ad, ax_ad = plt.subplots(figsize=(5, 4.5))
-    line_styles = ['--', '-.', ':', '-', '-.', ':', '--', '-.']
-    markers = ['o', 'v', '^', 'p', 's', '*', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', 'X']
-
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'regular'])
-        list_acc = [recall_per[id][x] for x in PERS]
-        ax_reg.plot(PERS, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
-        
-    ax_reg.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_reg.set_ylim(-0.05, 1.05)
-    ax_reg.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_reg.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_reg.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
-
-    fig_reg.tight_layout()
-    fig_reg.savefig('recall_regular_per.png', dpi=400)
-
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'adaptive'])
-        list_acc = [recall_per[id][x] for x in PERS]
-        ax_ad.plot(PERS, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
-
-    ax_ad.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_ad.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_ad.set_ylim(-0.05, 1.05)
-    ax_ad.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_ad.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
-
-    fig_ad.tight_layout()
-    fig_ad.savefig('recall_adaptive_per.png', dpi=400)
-
-def fig_f1_score():
-    FONT_SIZE = 15
-    LABEL_SIZE = 12
-    fig_reg, ax_reg = plt.subplots(figsize=(5, 4.5))
-    fig_ad, ax_ad = plt.subplots(figsize=(5, 4.5))
-    line_styles = ['--', '-.', ':', '-', '-.', ':', '--', '-.']
-    markers = ['o', 'v', '^', 'p', 's', '*', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', 'X']
-
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'regular'])
-        list_acc = [f1_score_per[id][x] for x in PERS]
-        ax_reg.plot(PERS, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
-        
-    ax_reg.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_reg.set_ylim(-0.05, 1.05)
-    ax_reg.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_reg.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_reg.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
-
-    fig_reg.tight_layout()
-    fig_reg.savefig('f1_score_regular_per.png', dpi=400)
-
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'adaptive'])
-        list_acc = [f1_score_per[id][x] for x in PERS]
-        ax_ad.plot(PERS, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
-
-    ax_ad.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_ad.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_ad.set_ylim(-0.05, 1.05)
-    ax_ad.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_ad.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
-
-    fig_ad.tight_layout()
-    fig_ad.savefig('f1_score_adaptive_per.png', dpi=400)
-
-def fig_n_clusters():
-    FONT_SIZE = 15
-    LABEL_SIZE = 12
-    fig_reg, ax_reg = plt.subplots(figsize=(5, 4.5))
-    fig_ad, ax_ad = plt.subplots(figsize=(5, 4.5))
-    line_styles = ['--', '-.', ':', '-', '-.', ':', '--', '-.']
-    markers = ['o', 'v', '^', 'p', 's', '*', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', 'X']
-
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'regular'])
-        list_acc = [n_clusters[id][x] for x in pers]
-        ax_reg.plot(pers, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
-        
-    ax_reg.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_reg.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_reg.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_reg.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
-
-    fig_reg.tight_layout()
-    fig_reg.savefig('n_clusters_regular_per.png', dpi=400)
-
-    for ind_param, nb_bin in enumerate(NB_BINS_VARY):
-        id = '_'.join([str(MIN_PKT_PROTO), str(nb_bin), 'adaptive'])
-        list_acc = [n_clusters[id][x] for x in pers]
-        ax_ad.plot(pers, list_acc,  label= r'$b =%d$' % (nb_bin), marker=markers[ind_param], ls=line_styles[ind_param], markersize=8, linewidth=2)
-
-    ax_ad.tick_params(axis='both', which='major', labelsize=LABEL_SIZE)
-    ax_ad.legend(loc='lower center', bbox_to_anchor=(0.47, 1), shadow=True, ncol=3, fontsize=FONT_SIZE-3)
-    ax_ad.set_xlabel(r'$\epsilon$', fontsize= FONT_SIZE)
-    ax_ad.set_xticklabels([r'0', r'0.2b', '0.4b', '0.6b', '0.8b', 'b'])
-
-    fig_ad.tight_layout()
-    fig_ad.savefig('n_clusters_adaptive_per.png', dpi=400)
+        fig.tight_layout()
+        fig.savefig(metric + '_' + bins_type + '.png')
 
 def main(argv):
-    init()
-    define_adaptive_bins()
-    tpr_clusters, fpr_clusters = botFP_clus()
+    scenarios, packets, hosts_training, hosts_test = initialisation()
+    ad_bins = define_adaptive_bins()
+    tpr_clusters, fpr_clusters, accuracy, nb_clusters = botFP_clus(packets, scenarios, hosts_training, hosts_test, ad_bins)
+    print(tpr_clusters, fpr_clusters, accuracy, nb_clusters)
+    # for metric, metric_values in {'tpr': tpr_cl, 'fpr': fpr_cl, 'nb_clusters': n_clusters}:
+    #     plot_figure(metric, metric_values)
     return 0
 
 if __name__ == '__main__':
