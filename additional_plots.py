@@ -14,15 +14,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from Settings import *
+from detection import initialisation
 
 # merge all datasets and draw histograms of nb of pkts per protocol
-def hist_parameter_m(per):
-    all_hosts = get_list_hosts('training', 0)
+def hist_parameter_m(per, scenarios, packets, list_hosts):
     for p in protocols:
         fig, ax = plt.subplots()
-        dataset_hosts = [int(host.split('_')[0]) for host in all_hosts]
-        name_hosts = [host.split('_')[1] for host in all_hosts]
-        nbs = {host: out_src[datasets[dataset_hosts[i]]][name_hosts[i]][p.proto].shape[0] for i, host in enumerate(all_hosts)}
+        scenario_hosts = [int(host.split('_')[0]) for host in list_hosts] # hosts from scenario 0
+        name_hosts = [host.split('_')[1] for host in list_hosts]
+        nbs = {host: packets[scenarios[scenario_hosts[i]]][name_hosts[i]][p.proto].shape[0] for i, host in enumerate(list_hosts)}
         nbs_sorted = list(nbs.values())
         nbs_sorted.sort()
         nbs_sorted = nbs_sorted[:int(per / 100 * len(nbs_sorted))]
@@ -36,8 +36,8 @@ def hist_parameter_m(per):
         print(counts)
         fig.savefig('hist_' + p.proto + '_' + per + '%.png', dpi=400)
 
-def overview_graph(host):
-    dataset = datasets[0]
+def overview_graph(host, packets):
+    scenario = scenarios[0]
     FONT_SIZE = 13
 
     fig = plt.figure(figsize=(15, 7), dpi=400)
@@ -49,8 +49,8 @@ def overview_graph(host):
             legend = 'UDP'
         if p.proto == 'icmp':
             legend = 'ICMP'
-        im = ax.scatter(p.get_list(out_src[dataset][host], 'Sport'),
-                     p.get_list(out_src[dataset][host], 'Dport'), alpha=0.3, color=p.color, marker='o', label=legend)
+        im = ax.scatter(p.get_list(packets[scenario][host], 'Sport'),
+                     p.get_list(packets[scenario][host], 'Dport'), alpha=0.3, color=p.color, marker='o', label=legend)
 
     ax.set_xlim(0, 65536)
     ax.set_ylim(0, 65536)
@@ -60,16 +60,16 @@ def overview_graph(host):
 
     ax = fig.add_subplot(1, 3, 2)
     for p in protocols:
-        im = ax.scatter(p.get_list(out_src[dataset][host], 'Sport'),
-                     p.get_list(out_src[dataset][host], 'DstAddr'), color=p.color, marker='o')
+        im = ax.scatter(p.get_list(packets[scenario][host], 'Sport'),
+                     p.get_list(packets[scenario][host], 'DstAddr'), color=p.color, marker='o')
     ax.set_xlim(0, 65536)
     ax.set_ylim(0, 2 ** 32)
     ax.set_xlabel('srcPort', fontsize=FONT_SIZE)
     ax.set_ylabel('dstIP', fontsize=FONT_SIZE)
 
     ax = fig.add_subplot(1, 3, 3)
-    im = ax.scatter(p.get_list(out_src[dataset][host], 'Dport'),
-                 p.get_list(out_src[dataset][host], 'DstAddr'), color=p.color, marker='o')
+    im = ax.scatter(p.get_list(packets[scenario][host], 'Dport'),
+                 p.get_list(packets[scenario][host], 'DstAddr'), color=p.color, marker='o')
     ax.set_xlim(0, 65536)
     ax.set_ylim(0, 2 ** 32)
     ax.set_xlabel('dstPort', fontsize=FONT_SIZE)
@@ -77,8 +77,8 @@ def overview_graph(host):
 
     fig.savefig('host_benign.png')
 
-def comparison_two_hosts():
-    dataset = datasets[0]
+def comparison_two_hosts(packets):
+    scenario = scenarios[0]
     FONT_SIZE = 16
     N_BINS = 32
     WIDTH = 0
@@ -95,9 +95,9 @@ def comparison_two_hosts():
     for ind_h, id_host in enumerate(ids):
         for ind_feat, feat in enumerate(features):
             ax = fig.add_subplot(3, 2, 1 + ind_h + 2 * ind_feat)
-            ind_d, host = id_host.split('_')
+            ind_s, host = id_host.split('_')
             p, a = feat[:]
-            hist, bin_edges = np.histogram(p.get_list(out_src[datasets[int(ind_d)]][host], a.att),
+            hist, bin_edges = np.histogram(p.get_list(packets[scenarios[int(ind_s)]][host], a.att),
                                             bins=N_BINS, range=[0, a. limit], density=True)
             if a.label == 'sport' or a.label == 'dport':
                 WIDTH = 2048
@@ -121,11 +121,15 @@ def comparison_two_hosts():
     fig.savefig('hist.png', dpi=400)
 
 def main(argv):
-    per = 70 # representing the 70% smallest hosts
-    hist_parameter_m(per)
+    scenarios, packets, hosts_training, hosts_test = initialisation()
 
-    host = '147.32.84.17' # '147.32.84.17' for benign host, '147.32.84.165' for bot
-    overview_graph(host)
+    per = 70 # representing the 70% smallest hosts
+    hist_parameter_m(per, scenarios, packets, hosts_training)
+
+    overview_graph('147.32.84.17', packets) # '147.32.84.17' for benign host, '147.32.84.165' for bot
+    overview_graph('147.32.84.165', packets)
+
+    comparison_two_hosts(packets)
     return 0
 
 if __name__ == '__main__':

@@ -24,6 +24,7 @@ import warnings
 import csv
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
+from matplotlib.ticker import MaxNLocator
 
 warnings.filterwarnings('ignore')
 

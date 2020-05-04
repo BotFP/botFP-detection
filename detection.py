@@ -87,8 +87,8 @@ def define_adaptive_bins():
             step = a.limit / 1000 # e.g. for source port, divide the maximum (65,536) into 1,000 bins and compute number of different ports for each bin
             # e.g. in the range [0, 1023]: a lot of different destination port numbers but small different source port numbers
             bin_edges = np.arange(0, a.limit, step)
-            cumsum = np.cumsum(vectors[feature])
-            cumsum = np.insert(cumsum, 0, 0.0)
+            cumsum = np.cumsum(vectors[feature]) # vectors.csv contains the number of unique elements in each of the 1,000 bins, for each feature
+            cumsum = np.insert(cumsum, 0, 0.0) # add 0 for the first bin, to get the right number of values
 
             # then here, form nb_bin bins (e.g. 32 bins) so that there is the same number of ports in each bin
             # the bins will then have an adaptive width depending on the amount of information
@@ -142,8 +142,13 @@ def main(argv):
     ad_bins = define_adaptive_bins()
     tpr_clusters, fpr_clusters, accuracy, nb_clusters = botFP_clus(packets, scenarios, hosts_training, hosts_test, ad_bins)
     print(tpr_clusters, fpr_clusters, accuracy, nb_clusters)
+
+    # for tuning: change parameters in Settings.py and run this code
+    # tpr_clusters, fpr_clusters, accuracy, nb_clusters = botFP_clus(packets, scenarios, hosts_training, hosts_test, ad_bins)
+    # print(tpr_clusters, fpr_clusters, accuracy, nb_clusters)
     # for metric, metric_values in {'tpr': tpr_cl, 'fpr': fpr_cl, 'nb_clusters': n_clusters}:
     #     plot_figure(metric, metric_values)
+
     return 0
 
 if __name__ == '__main__':
